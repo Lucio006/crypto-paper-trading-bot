@@ -1,51 +1,51 @@
 """
-Level 5: LinkedIn personal contact finder via Bing + stealth mode.
-playwright-stealth patches browser fingerprints so Bing doesn't show CAPTCHA.
-Extracts name, title, LinkedIn URL from search snippets — no login, no invented data.
+Level 5: LinkedIn personal contact finder.
+Uses a saved li_at session cookie to search LinkedIn directly.
+Searches for employees by company name + role keywords.
+Falls back gracefully if cookie missing or LinkedIn blocks.
 """
 from __future__ import annotations
 import asyncio
 import re
-from urllib.parse import quote_plus, unquote
+from urllib.parse import quote_plus
 from playwright.async_api import BrowserContext
-from playwright_stealth import stealth_async
 from models import Company
+from config import LINKEDIN_COOKIE
 
-_BING = "https://www.bing.com/search?q={q}&count=10&setlang=en"
+_SEARCH_URL = (
+    "https://www.linkedin.com/search/results/people/"
+    "?keywords={q}&origin=GLOBAL_SEARCH_HEADER"
+)
 
-_ROLE_QUERIES = [
-    "events sponsorship partnerships",
+_ROLE_FILTERS = [
+    "events sponsorship",
     "marketing communications",
-    "affiliate business development",
+    "affiliate partnerships",
     "CEO CCO director",
 ]
 
-_LI_SLUG_RE = re.compile(r"linkedin\.com/in/([\w\-%]+)", re.IGNORECASE)
-
-_NAME_TITLE_RE = re.compile(
-    r"^(.+?)\s*[-–]\s*(.+?)(?:\s+(?:at|en|@)\s+.+?)?(?:\s*[|·]\s*LinkedIn.*)?$",
-    re.IGNORECASE | re.UNICODE,
-)
-
 
 async def find_personal_contacts(company: Company, context: BrowserContext) -> Company:
-    """Search Bing for LinkedIn profiles of people at this company. Never raises."""
-    if not company.name_original:
+    """
+    Search LinkedIn for employees of this company. Never raises.
+    Requires LINKEDIN_COOKIE in .env — skips silently if missing.
+    """
+    if not LINKEDIN_COOKIE or not company.name_original:
         return company
 
     found: dict[str, dict] = {}
 
-    for role_terms in _ROLE_QUERIES:
+    for role in _ROLE_FILTERS:
         if len(found) >= 5:
             break
-        query = f'site:linkedin.com/in "{company.name_original}" {role_terms}'
+        query = f"{company.name_original} {role}"
         try:
-            contacts = await _bing_search(context, query, company.name_original)
+            contacts = await _search_people(context, query, company.name_original)
             for c in contacts:
-                slug = c["url"].split("/in/")[-1].strip("/").lower()
-                if slug and slug not in found:
-                    found[slug] = c
-            await asyncio.sleep(2)
+                key = c["url"].split("/in/")[-1].strip("/").lower()
+                if key and key not in found:
+                    found[key] = c
+            await asyncio.sleep(3)
         except Exception:
             continue
 
@@ -59,44 +59,29 @@ async def find_personal_contacts(company: Company, context: BrowserContext) -> C
     return company
 
 
-async def _bing_search(context: BrowserContext, query: str, company_name: str) -> list[dict]:
+async def _search_people(context: BrowserContext, query: str, company_name: str) -> list[dict]:
     page = await context.new_page()
-    await stealth_async(page)
     contacts: list[dict] = []
     try:
-        url = _BING.format(q=quote_plus(query))
+        url = _SEARCH_URL.format(q=quote_plus(query))
         await page.goto(url, timeout=30_000, wait_until="domcontentloaded")
-        await page.wait_for_timeout(2_000)
+        await page.wait_for_timeout(2_500)
 
-        # Bing result structure: li.b_algo contains h2 > a (title+link) and p (snippet)
-        results = await page.locator("li.b_algo").all()
+        # If redirected to login wall, cookie has expired
+        if "linkedin.com/login" in page.url or "authwall" in page.url:
+            return []
 
-        for result in results[:15]:
+        # LinkedIn people search results
+        results = await page.locator("li.reusable-search__result-container").all()
+        if not results:
+            # Fallback selector for newer LinkedIn UI
+            results = await page.locator("[data-view-name='search-entity-result-universal-template']").all()
+
+        for result in results[:8]:
             try:
-                # Get title and href from the main link
-                link = result.locator("h2 a").first
-                if await link.count() == 0:
-                    continue
-
-                title_text = await link.inner_text()
-                href = await link.get_attribute("href") or ""
-
-                # Bing uses direct hrefs (not redirects like Google)
-                if "linkedin.com/in/" not in href.lower():
-                    # Also check the displayed URL (cite)
-                    cite = result.locator("cite")
-                    if await cite.count() > 0:
-                        href = await cite.first.inner_text()
-
-                m = _LI_SLUG_RE.search(unquote(href))
-                if not m:
-                    continue
-
-                linkedin_url = f"https://www.linkedin.com/in/{m.group(1)}"
-                contact = _parse_title(title_text, linkedin_url, company_name)
+                contact = await _parse_result(result, company_name)
                 if contact:
                     contacts.append(contact)
-
             except Exception:
                 continue
 
@@ -105,19 +90,60 @@ async def _bing_search(context: BrowserContext, query: str, company_name: str) -
     return contacts
 
 
-def _parse_title(title_text: str, linkedin_url: str, company_name: str) -> dict | None:
-    if not title_text:
-        return {"name": "—", "title": "—", "url": linkedin_url}
+async def _parse_result(result, company_name: str) -> dict | None:
+    # Name
+    name = ""
+    for sel in [
+        ".entity-result__title-text a span[aria-hidden='true']",
+        ".app-aware-link span[aria-hidden='true']",
+        "span.entity-result__title-line span[aria-hidden]",
+    ]:
+        try:
+            el = result.locator(sel).first
+            if await el.count() > 0:
+                name = (await el.inner_text()).strip()
+                if name and name != "LinkedIn Member":
+                    break
+        except Exception:
+            pass
 
-    clean = re.sub(r"\s*[|·]\s*LinkedIn.*$", "", title_text, flags=re.IGNORECASE).strip()
-    m = _NAME_TITLE_RE.match(clean)
-    if not m:
-        return {"name": clean[:60] or "—", "title": "—", "url": linkedin_url}
+    if not name or name == "LinkedIn Member":
+        return None
 
-    name = m.group(1).strip()
-    title = m.group(2).strip()
+    # Title / headline
+    title = ""
+    for sel in [
+        ".entity-result__primary-subtitle",
+        ".entity-result__summary",
+        "[data-anonymize='job-title']",
+    ]:
+        try:
+            el = result.locator(sel).first
+            if await el.count() > 0:
+                title = (await el.inner_text()).strip()
+                if title:
+                    break
+        except Exception:
+            pass
 
-    if len(name.split()) < 2 or len(name) > 60:
-        return {"name": clean[:60], "title": title or "—", "url": linkedin_url}
+    # Profile URL
+    url = ""
+    for sel in [
+        "a.app-aware-link[href*='/in/']",
+        ".entity-result__title-text a[href*='/in/']",
+    ]:
+        try:
+            el = result.locator(sel).first
+            if await el.count() > 0:
+                href = await el.get_attribute("href") or ""
+                m = re.search(r"linkedin\.com/in/([\w\-%]+)", href)
+                if m:
+                    url = f"https://www.linkedin.com/in/{m.group(1)}"
+                    break
+        except Exception:
+            pass
 
-    return {"name": name, "title": title, "url": linkedin_url}
+    if not url:
+        return None
+
+    return {"name": name, "title": title or "—", "url": url}

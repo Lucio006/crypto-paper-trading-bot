@@ -22,7 +22,7 @@ from sheets.writer import (
     ensure_base_tabs, write_event_tab,
     update_index, upsert_base, read_base_companies,
 )
-from config import MAX_COMPANIES, NAV_TIMEOUT_MS
+from config import MAX_COMPANIES, NAV_TIMEOUT_MS, LINKEDIN_COOKIE
 
 _UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -65,6 +65,15 @@ async def run(
             user_agent=_UA,
             viewport={"width": 1280, "height": 900},
         )
+        if LINKEDIN_COOKIE:
+            await context.add_cookies([{
+                "name": "li_at",
+                "value": LINKEDIN_COOKIE,
+                "domain": ".linkedin.com",
+                "path": "/",
+                "httpOnly": True,
+                "secure": True,
+            }])
 
         try:
             # ── Validate URL ─────────────────────────────────────────────────

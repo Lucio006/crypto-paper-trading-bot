@@ -14,6 +14,9 @@ CREDENTIALS_PATH: str = os.environ.get(
     str(BASE_DIR / "credentials" / "service_account.json"),
 )
 
+# ── LinkedIn ──────────────────────────────────────────────────────────────────
+LINKEDIN_COOKIE: str = os.environ.get("LINKEDIN_COOKIE", "")
+
 # ── Anthropic ─────────────────────────────────────────────────────────────────
 ANTHROPIC_API_KEY: str = os.environ.get("ANTHROPIC_API_KEY", "")
 
