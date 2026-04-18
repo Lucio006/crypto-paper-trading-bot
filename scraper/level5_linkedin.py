@@ -1,20 +1,18 @@
 """
 Level 5: LinkedIn personal contact finder.
-Uses Google (better LinkedIn indexing than DuckDuckGo) to find individual
-LinkedIn profiles linked to the company.
-Extracts name, job title, and LinkedIn URL from search result snippets —
-no LinkedIn login required, no invented data.
+Uses Google (better LinkedIn indexing) to find individual LinkedIn profiles.
+Parses result titles and decoded URLs from the HTML source.
+No LinkedIn login required. No invented data.
 """
 from __future__ import annotations
 import asyncio
 import re
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, unquote
 from playwright.async_api import BrowserContext
 from models import Company
 
-_GOOGLE = "https://www.google.com/search?q={q}&num=10&hl=en"
+_GOOGLE = "https://www.google.com/search?q={q}&num=10&hl=en&gl=es"
 
-# Role combinations in priority order for iGaming / affiliate prospecting
 _ROLE_QUERIES = [
     "events sponsorship partnerships",
     "marketing communications",
@@ -22,31 +20,28 @@ _ROLE_QUERIES = [
     "CEO CCO director",
 ]
 
-_LI_URL_RE = re.compile(r"linkedin\.com/in/([\w%\-]+)", re.IGNORECASE)
+_LI_SLUG_RE = re.compile(r"linkedin\.com/in/([\w\-%]+)", re.IGNORECASE)
 
-# Google result title: "Name - Title at Company | LinkedIn"
-_TITLE_RE = re.compile(
-    r"^(.+?)\s*[-–]\s*(.+?)\s*(?:\bat\b|\ben\b)?.*?(?:[|\-]\s*LinkedIn|$)",
+# "Firstname Lastname - Job Title at Company | LinkedIn"
+_NAME_TITLE_RE = re.compile(
+    r"^(.+?)\s*[-–]\s*(.+?)(?:\s+(?:at|en|@)\s+.+?)?(?:\s*[|·]\s*LinkedIn.*)?$",
     re.IGNORECASE | re.UNICODE,
 )
 
 
 async def find_personal_contacts(company: Company, context: BrowserContext) -> Company:
-    """
-    Search Google for individual LinkedIn profiles related to the company.
-    Mutates company.personal_contacts. Never raises.
-    """
+    """Search Google for LinkedIn profiles of people at this company. Never raises."""
     if not company.name_original:
         return company
 
-    found: dict[str, dict] = {}  # slug → {name, title, url}
+    found: dict[str, dict] = {}
 
     for role_terms in _ROLE_QUERIES:
         if len(found) >= 5:
             break
         query = f'site:linkedin.com/in "{company.name_original}" {role_terms}'
         try:
-            contacts = await _google_search(context, query, company.name_original)
+            contacts = await _search(context, query, company.name_original)
             for c in contacts:
                 slug = c["url"].split("/in/")[-1].strip("/").lower()
                 if slug and slug not in found:
@@ -65,57 +60,58 @@ async def find_personal_contacts(company: Company, context: BrowserContext) -> C
     return company
 
 
-async def _google_search(context: BrowserContext, query: str, company_name: str) -> list[dict]:
-    """Search Google and extract LinkedIn profile cards from results."""
-    url = _GOOGLE.format(q=quote_plus(query))
+async def _search(context: BrowserContext, query: str, company_name: str) -> list[dict]:
     page = await context.new_page()
     contacts: list[dict] = []
     try:
-        await page.goto(url, timeout=30_000, wait_until="domcontentloaded")
-        await page.wait_for_timeout(1_500)
+        await page.goto(_GOOGLE.format(q=quote_plus(query)), timeout=30_000,
+                        wait_until="domcontentloaded")
+        await page.wait_for_timeout(2_000)
 
-        # Handle cookie consent if shown
-        for btn_text in ["Accept all", "Aceptar todo", "I agree"]:
-            btn = page.locator(f"button:has-text('{btn_text}')")
-            if await btn.count() > 0:
-                await btn.first.click()
-                await page.wait_for_timeout(800)
-                break
-
-        # Google result blocks: each is a <div class="g"> or similar
-        # Extract title + URL from each result
-        result_links = await page.locator("a[href*='linkedin.com/in/']").all()
-        seen_urls: set[str] = set()
-
-        for link in result_links[:20]:
+        # Accept Google cookie consent if shown
+        for sel in ["#L2AGLb", "button:has-text('Accept all')",
+                    "button:has-text('Aceptar todo')"]:
             try:
-                href = await link.get_attribute("href") or ""
-                m_url = _LI_URL_RE.search(href)
-                if not m_url:
-                    continue
-                slug = m_url.group(1).lower()
-                if slug in seen_urls:
-                    continue
-                seen_urls.add(slug)
-                linkedin_url = f"https://www.linkedin.com/in/{m_url.group(1)}"
-
-                # Get the visible title text from the parent result block
-                # Try h3 inside the same result, then the link text itself
-                title_text = ""
-                try:
-                    h3 = link.locator("xpath=ancestor::div[contains(@class,'g')]//h3")
-                    if await h3.count() > 0:
-                        title_text = await h3.first.inner_text()
-                except Exception:
-                    pass
-                if not title_text:
-                    title_text = await link.inner_text()
-
-                contact = _parse_title(title_text, linkedin_url, company_name)
-                if contact:
-                    contacts.append(contact)
+                el = page.locator(sel)
+                if await el.count() > 0:
+                    await el.first.click()
+                    await page.wait_for_timeout(1_000)
+                    break
             except Exception:
+                pass
+
+        # Google wraps result URLs as /url?q=https%3A%2F%2Flinkedin.com%2Fin%2F...
+        # Decode the full HTML to find real LinkedIn URLs
+        html = await page.content()
+        decoded_html = unquote(html)
+
+        # Find all LinkedIn /in/ slugs from decoded HTML
+        slugs_found = _LI_SLUG_RE.findall(decoded_html)
+
+        # Find result titles: h3 elements containing "LinkedIn"
+        h3_elements = await page.locator("h3").all()
+        titles: list[str] = []
+        for h3 in h3_elements[:20]:
+            try:
+                text = await h3.inner_text()
+                if "linkedin" in text.lower() or "–" in text or " - " in text:
+                    titles.append(text)
+            except Exception:
+                pass
+
+        # Pair each unique slug with the corresponding title
+        seen: set[str] = set()
+        for i, slug in enumerate(slugs_found):
+            clean_slug = slug.strip("/").lower()
+            if clean_slug in seen or len(clean_slug) < 3:
                 continue
+            seen.add(clean_slug)
+
+            title_text = titles[i] if i < len(titles) else ""
+            linkedin_url = f"https://www.linkedin.com/in/{slug}"
+            contact = _parse_title(title_text, linkedin_url, company_name)
+            if contact:
+                contacts.append(contact)
 
     finally:
         await page.close()
@@ -123,28 +119,18 @@ async def _google_search(context: BrowserContext, query: str, company_name: str)
 
 
 def _parse_title(title_text: str, linkedin_url: str, company_name: str) -> dict | None:
-    """Parse 'Name - Job Title at Company | LinkedIn' into a contact dict."""
     if not title_text:
-        return None
+        return {"name": "—", "title": "—", "url": linkedin_url}
 
-    # Strip "| LinkedIn" and everything after
-    clean = re.sub(r"\s*[|\-]\s*LinkedIn.*$", "", title_text, flags=re.IGNORECASE).strip()
-
-    m = _TITLE_RE.match(clean)
+    clean = re.sub(r"\s*[|·]\s*LinkedIn.*$", "", title_text, flags=re.IGNORECASE).strip()
+    m = _NAME_TITLE_RE.match(clean)
     if not m:
-        # Fallback: if we can't parse a name-title, still return the URL with raw title
-        words = clean.split()
-        if len(words) >= 2:
-            return {"name": clean[:60], "title": "—", "url": linkedin_url}
-        return None
+        return {"name": clean[:60] or "—", "title": "—", "url": linkedin_url}
 
     name = m.group(1).strip()
     title = m.group(2).strip()
 
-    # Sanity checks
     if len(name.split()) < 2 or len(name) > 60:
-        return None
-    if len(title) < 3:
-        return None
+        return {"name": clean[:60], "title": title or "—", "url": linkedin_url}
 
     return {"name": name, "title": title, "url": linkedin_url}
