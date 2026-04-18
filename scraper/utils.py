@@ -1,109 +1,117 @@
+"""
+Deterministic extraction utilities — no LLM, no Playwright.
+Pure regex and string operations on HTML text.
+"""
 from __future__ import annotations
 import re
 import unicodedata
 from urllib.parse import urlparse, urljoin
 
-# ──────────────────────────────────────────────
-# Regex patterns
-# ──────────────────────────────────────────────
+# ── Regex patterns ────────────────────────────────────────────────────────────
 
-EMAIL_RE = re.compile(
+_EMAIL_RE = re.compile(
     r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}",
     re.IGNORECASE,
 )
 
-PHONE_RE = re.compile(
-    r"(?:\+?\d[\d\s\-().]{7,}\d)",
+_PHONE_RE = re.compile(
+    r"(?:\+?\d[\d\s\-().]{6,}\d)"
 )
 
-TELEGRAM_RE = re.compile(
+_TELEGRAM_RE = re.compile(
     r"(?:t\.me|telegram\.me|telegram\.org)/([A-Za-z0-9_]{3,})",
     re.IGNORECASE,
 )
 
-# Suffixes to strip for name normalization
-COMPANY_SUFFIXES = re.compile(
+# Company name suffixes to strip before normalization
+_SUFFIXES_RE = re.compile(
     r"\b(?:s\.?l\.?u?\.?|s\.?a\.?u?\.?|s\.?a\.?|s\.?l\.?|ltd\.?|inc\.?|llc\.?|"
     r"gmbh\.?|corp\.?|bv\.?|nv\.?|plc\.?|s\.?r\.?l\.?|s\.?p\.?a\.?|"
-    r"s\.?c\.?p\.?|c\.?b\.?|s\.?c\.?)\s*$",
+    r"s\.?c\.?p\.?|c\.?b\.?|s\.?c\.?|s\.?l\.?u\.?)\s*$",
     re.IGNORECASE,
 )
 
-MARKETING_EMAIL_RE = re.compile(
-    r"(?:marketing|mkt|comunicacion|comunica|prensa|press|media|publicidad|ads)\b",
-    re.IGNORECASE,
-)
-EVENTS_EMAIL_RE = re.compile(
-    r"(?:eventos|events|feria|expo|exhibition|sponsor|partnership|patrocin)",
-    re.IGNORECASE,
-)
-CEO_EMAIL_RE = re.compile(
-    r"(?:ceo|director|directora|gerente|presidente|president|cto|coo|founder)\b",
-    re.IGNORECASE,
-)
-CCO_EMAIL_RE = re.compile(
-    r"(?:cco|comercial|ventas|sales|business|desarrollo)\b",
-    re.IGNORECASE,
-)
+# Email local-part classifiers
+_MKT_RE    = re.compile(r"(?:marketing|mkt|comunicacion|comunica|prensa|press|media|publicidad)", re.I)
+_EVENTS_RE = re.compile(r"(?:eventos|events|feria|expo|exhibition|sponsor|partnership|patrocin)", re.I)
+_CEO_RE    = re.compile(r"(?:ceo|director|directora|gerente|presidente|president|founder|cto|coo)", re.I)
+_CCO_RE    = re.compile(r"(?:cco|comercial|ventas|sales|business|desarrollo|bdm)", re.I)
 
 
-# ──────────────────────────────────────────────
-# Text normalization
-# ──────────────────────────────────────────────
+# ── Name normalization ────────────────────────────────────────────────────────
 
 def normalize_name(name: str) -> str:
-    """Lowercase, remove accents, punctuation and common company suffixes."""
+    """Lowercase, strip accents, remove company suffixes and punctuation."""
     text = name.strip()
-    # Remove accents
+    # Remove accent marks
     text = unicodedata.normalize("NFD", text)
     text = "".join(c for c in text if unicodedata.category(c) != "Mn")
     text = text.lower()
-    # Remove company suffixes
-    text = COMPANY_SUFFIXES.sub("", text).strip()
-    # Remove punctuation except spaces
+    # Remove known company suffixes
+    text = _SUFFIXES_RE.sub("", text).strip()
+    # Replace punctuation with space
     text = re.sub(r"[^\w\s]", " ", text)
     # Collapse whitespace
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
 
+# ── URL helpers ───────────────────────────────────────────────────────────────
+
 def extract_domain(url: str) -> str | None:
+    """Return bare domain without www., e.g. 'empresa.com'."""
+    if not url:
+        return None
     try:
-        parsed = urlparse(url if url.startswith("http") else "https://" + url)
-        host = parsed.netloc or parsed.path
-        # Strip www.
-        host = re.sub(r"^www\.", "", host).lower()
+        parsed = urlparse(url if "://" in url else "https://" + url)
+        host = parsed.netloc or parsed.path.split("/")[0]
+        host = re.sub(r"^www\.", "", host).lower().strip()
         return host or None
     except Exception:
         return None
 
 
 def normalize_url(url: str) -> str:
+    """Ensure URL has a scheme."""
     if not url:
         return url
-    if not url.startswith("http"):
-        return "https://" + url
-    return url
+    return url if url.startswith("http") else "https://" + url
 
 
-# ──────────────────────────────────────────────
-# Email extraction and classification
-# ──────────────────────────────────────────────
+def is_valid_url(url: str) -> bool:
+    try:
+        p = urlparse(url)
+        return p.scheme in ("http", "https") and bool(p.netloc)
+    except Exception:
+        return False
+
+
+def make_absolute(href: str, base_url: str) -> str:
+    return urljoin(base_url, href)
+
+
+# ── Email extraction and classification ───────────────────────────────────────
 
 def extract_emails(text: str) -> list[str]:
-    found = EMAIL_RE.findall(text)
-    # Deduplicate preserving order
+    """Extract all unique emails from a block of text, preserving order."""
+    found = _EMAIL_RE.findall(text)
     seen: set[str] = set()
     result = []
     for email in found:
         low = email.lower()
         if low not in seen:
             seen.add(low)
-            result.append(email.lower())
+            result.append(low)
     return result
 
 
 def classify_emails(emails: list[str]) -> dict[str, str | None]:
+    """
+    Assign emails to roles based on the local part.
+    Priority: marketing > events > ceo > cco > general.
+    Returns a dict with keys: email_general, email_marketing,
+    email_events, email_ceo, email_cco.
+    """
     result: dict[str, str | None] = {
         "email_general": None,
         "email_marketing": None,
@@ -113,56 +121,54 @@ def classify_emails(emails: list[str]) -> dict[str, str | None]:
     }
     for email in emails:
         local = email.split("@")[0]
-        if not result["email_marketing"] and MARKETING_EMAIL_RE.search(local):
+        if not result["email_marketing"] and _MKT_RE.search(local):
             result["email_marketing"] = email
-        elif not result["email_events"] and EVENTS_EMAIL_RE.search(local):
+        elif not result["email_events"] and _EVENTS_RE.search(local):
             result["email_events"] = email
-        elif not result["email_ceo"] and CEO_EMAIL_RE.search(local):
+        elif not result["email_ceo"] and _CEO_RE.search(local):
             result["email_ceo"] = email
-        elif not result["email_cco"] and CCO_EMAIL_RE.search(local):
+        elif not result["email_cco"] and _CCO_RE.search(local):
             result["email_cco"] = email
         elif not result["email_general"]:
             result["email_general"] = email
     return result
 
 
+# ── Phone extraction ──────────────────────────────────────────────────────────
+
 def extract_phone(text: str) -> str | None:
-    matches = PHONE_RE.findall(text)
-    for m in matches:
-        cleaned = re.sub(r"[\s\-()]", "", m)
-        if len(cleaned) >= 9:
-            return m.strip()
+    """Return the first phone-looking string with ≥9 digits."""
+    for match in _PHONE_RE.finditer(text):
+        raw = match.group(0).strip()
+        digits = re.sub(r"\D", "", raw)
+        if len(digits) >= 9:
+            return raw
     return None
 
+
+# ── Telegram extraction ───────────────────────────────────────────────────────
 
 def extract_telegram(text: str) -> str | None:
-    m = TELEGRAM_RE.search(text)
-    if m:
-        return f"t.me/{m.group(1)}"
-    return None
+    m = _TELEGRAM_RE.search(text)
+    return f"t.me/{m.group(1)}" if m else None
 
 
-def is_valid_url(url: str) -> bool:
-    try:
-        parsed = urlparse(url)
-        return parsed.scheme in ("http", "https") and bool(parsed.netloc)
-    except Exception:
-        return False
+# ── Missing data reasons ──────────────────────────────────────────────────────
 
-
-def make_absolute(href: str, base_url: str) -> str:
-    return urljoin(base_url, href)
-
-
-def reason_for_missing(field: str, page_status: str, page_content_hints: list[str]) -> str:
-    """Generate a human-readable reason why a field is missing."""
+def reason_for_missing(field: str, page_status: str, hints: list[str]) -> str:
+    """
+    Return a human-readable explanation for why a contact field is absent.
+    This is always shown in the sheet — no field is ever left blank without a reason.
+    """
+    if page_status in ("no_website",):
+        return "No aparece web corporativa en la ficha del evento"
     if "timeout" in page_status or "error" in page_status:
         return f"La web corporativa no cargó ({page_status})"
-    if "no_website" in page_status:
-        return "No aparece web corporativa en la ficha del evento"
-    if "form_only" in page_content_hints:
+    if "http_4" in page_status or "http_5" in page_status:
+        return f"La web corporativa devolvió error {page_status.replace('http_', '')}"
+    if "form_only" in hints and field in ("email_general", "email_marketing", "email_events"):
         return "Solo hay formulario de contacto, no hay email publicado"
-    if "no_contact_page" in page_content_hints:
+    if "no_contact_page" in hints and field in ("email_marketing", "email_events"):
         return "No se encontró página de contacto en la web"
     if field in ("email_ceo", "email_cco"):
         return "No hay emails directivos publicados en la web (habitual por GDPR)"
