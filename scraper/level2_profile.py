@@ -8,14 +8,48 @@ from playwright.async_api import BrowserContext
 from models import Company
 from scraper.utils import normalize_url, is_valid_url, make_absolute, extract_domain
 
-# Domains to skip when looking for the corporate website
+# ── Domains that are NEVER a company's corporate website ──────────────────────
+# (event registration forms, booking platforms, social media, etc.)
 _SKIP_DOMAINS = {
+    # Social
     "facebook.com", "instagram.com", "twitter.com", "x.com",
     "linkedin.com", "youtube.com", "tiktok.com", "pinterest.com",
-    "google.com", "whatsapp.com", "wa.me",
+    # Search / maps
+    "google.com", "maps.google.com", "bing.com",
+    # Messaging
+    "whatsapp.com", "wa.me", "t.me", "telegram.me",
+    # Event registration / booking platforms (common false positives)
+    "reg.buzz", "forms.reg.buzz",
+    "eventbrite.com", "cvent.com", "hopin.com",
+    "eventtia.com", "accelevents.com",
+    "hubspot.com", "mailchimp.com",
+    # Common CDNs and infrastructure
+    "cloudflare.com", "amazonaws.com", "azure.com",
 }
 
-# Selectors for description text within an exhibitor profile
+# ── Text patterns that indicate a "website" link ──────────────────────────────
+_WEBSITE_LINK_TEXT = re.compile(
+    r"(?:web(?:site)?|sitio\s*web|visitar\s*web|visit\s*website|"
+    r"ver\s*web|go\s*to\s*website|homepage|página\s*web)",
+    re.IGNORECASE,
+)
+
+# ── CSS selectors for the website field on exhibitor profile pages ─────────────
+_WEBSITE_FIELD_SELECTORS = [
+    # asp.events / iGB platform
+    "[class*='website']",
+    "[class*='web-link']",
+    "[class*='company-website']",
+    "[class*='exhibitor-website']",
+    # Generic
+    "[class*='social'] a[href^='http']",
+    "[data-field='website'] a",
+    "[data-label='website'] a",
+    "a[title*='website' i]",
+    "a[title*='web' i]",
+]
+
+# ── Selectors for description text ─────────────────────────────────────────────
 _DESC_SELECTORS = [
     "[class*='description']", "[class*='descripcion']",
     "[class*='about']", "[class*='profile-text']",
@@ -34,13 +68,16 @@ _CATEGORY_RE = re.compile(
 
 
 def _is_corporate(url: str, event_domain: str) -> bool:
+    """Return True only if this URL could be a real company website."""
+    if not url or not is_valid_url(url):
+        return False
     domain = extract_domain(url)
     if not domain:
         return False
     for skip in _SKIP_DOMAINS:
-        if domain.endswith(skip):
+        if domain == skip or domain.endswith("." + skip):
             return False
-    # Reject URLs that belong to the event site itself
+    # Reject if it belongs to the event site itself
     if event_domain and (domain == event_domain or domain.endswith("." + event_domain)):
         return False
     return True
@@ -51,10 +88,6 @@ async def scrape_profile(
     context: BrowserContext,
     event_domain: str,
 ) -> Company:
-    """
-    Visit the exhibitor's profile page and enrich the Company object in place.
-    Never raises — failures are silently skipped so the pipeline continues.
-    """
     if not company.exhibitor_profile_url:
         return company
 
@@ -65,10 +98,10 @@ async def scrape_profile(
             timeout=25_000,
             wait_until="domcontentloaded",
         )
-        await page.wait_for_timeout(1200)
+        await page.wait_for_timeout(1500)
         body_text = await page.inner_text("body")
 
-        # ── Description ───────────────────────────────────────────────────────
+        # ── Description ────────────────────────────────────────────────────────
         if not company.description:
             for sel in _DESC_SELECTORS:
                 try:
@@ -81,35 +114,61 @@ async def scrape_profile(
                 except Exception:
                     continue
 
-        # ── Stand (if not found in L1) ────────────────────────────────────────
+        # ── Stand / Category (if missing from L1) ──────────────────────────────
         if not company.stand:
             m = _STAND_RE.search(body_text)
             if m:
                 company.stand = m.group(1).strip()
-
-        # ── Category (if not found in L1) ─────────────────────────────────────
         if not company.category:
             m = _CATEGORY_RE.search(body_text)
             if m:
                 company.category = m.group(1).strip()
 
-        # ── Corporate website ─────────────────────────────────────────────────
+        # ── Corporate website — 3 passes ───────────────────────────────────────
         corporate_url = None
 
-        # Pass 1: external links in the page
-        try:
-            links = await page.locator("a[href^='http']").all()
-            for link in links:
-                href = (await link.get_attribute("href") or "").strip()
-                if is_valid_url(href) and _is_corporate(href, event_domain):
-                    corporate_url = href
+        # Pass 1: dedicated "website" field selectors
+        for sel in _WEBSITE_FIELD_SELECTORS:
+            try:
+                links = await page.locator(sel).all()
+                for link in links:
+                    href = (await link.get_attribute("href") or "").strip()
+                    if _is_corporate(href, event_domain):
+                        corporate_url = href
+                        break
+                if corporate_url:
                     break
-        except Exception:
-            pass
+            except Exception:
+                continue
 
-        # Pass 2: raw URLs in body text (e.g., in a "Visitar web" text node)
+        # Pass 2: links whose visible text says "website" or "web"
         if not corporate_url:
-            for raw in re.findall(r"https?://[^\s\"'<>]{6,}", body_text):
+            try:
+                all_links = await page.locator("a[href^='http']").all()
+                for link in all_links:
+                    text = (await link.inner_text()).strip()
+                    href = (await link.get_attribute("href") or "").strip()
+                    if _WEBSITE_LINK_TEXT.search(text) and _is_corporate(href, event_domain):
+                        corporate_url = href
+                        break
+            except Exception:
+                pass
+
+        # Pass 3: any external link that's not a known non-corporate domain
+        if not corporate_url:
+            try:
+                all_links = await page.locator("a[href^='http']").all()
+                for link in all_links:
+                    href = (await link.get_attribute("href") or "").strip()
+                    if _is_corporate(href, event_domain):
+                        corporate_url = href
+                        break
+            except Exception:
+                pass
+
+        # Pass 4: raw URLs in body text
+        if not corporate_url:
+            for raw in re.findall(r"https?://[^\s\"'<>]{8,}", body_text):
                 if _is_corporate(raw, event_domain):
                     corporate_url = raw
                     break
