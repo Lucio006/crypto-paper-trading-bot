@@ -27,7 +27,7 @@ results += [
     check("quita sufijo S.L.",     normalize_name("Empresa Ejemplo S.L."), "empresa ejemplo"),
     check("quita sufijo LLC",      normalize_name("Acme Corp LLC"),        "acme corp"),
     check("colapsa espacios",      normalize_name("  Foo   Bar  "),        "foo bar"),
-    check("quita puntuación",      normalize_name("Foo & Bar, S.A."),      "foo  bar"),
+    check("quita puntuación",      normalize_name("Foo & Bar, S.A."),      "foo bar"),
 ]
 
 print("\n── extract_domain ───────────────────────────────────")
