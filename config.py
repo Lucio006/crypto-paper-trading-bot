@@ -20,6 +20,9 @@ ANTHROPIC_API_KEY: str = os.environ.get("ANTHROPIC_API_KEY", "")
 PAGE_TIMEOUT_MS: int = 30_000   # per-page load
 NAV_TIMEOUT_MS: int = 60_000    # browser navigation
 
+# ── Pipeline limits ───────────────────────────────────────────────────────────
+MAX_COMPANIES: int | None = None   # None = no limit
+
 # ── Deduplication thresholds (rapidfuzz token_sort_ratio 0–100) ───────────────
 FUZZY_HIGH: int = 85   # ≥ this → automatic match
 FUZZY_LOW: int = 70    # between LOW and HIGH → flag for manual review
