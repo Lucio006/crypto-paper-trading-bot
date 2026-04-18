@@ -1,14 +1,14 @@
 """
-Level 5: LinkedIn personal contact finder via Bing.
-Bing (owned by Microsoft/LinkedIn) has the best LinkedIn index and is
-more bot-tolerant than Google. Extracts name, title, LinkedIn URL from
-search snippets — no login, no invented data.
+Level 5: LinkedIn personal contact finder via Bing + stealth mode.
+playwright-stealth patches browser fingerprints so Bing doesn't show CAPTCHA.
+Extracts name, title, LinkedIn URL from search snippets — no login, no invented data.
 """
 from __future__ import annotations
 import asyncio
 import re
 from urllib.parse import quote_plus, unquote
 from playwright.async_api import BrowserContext
+from playwright_stealth import stealth_async
 from models import Company
 
 _BING = "https://www.bing.com/search?q={q}&count=10&setlang=en"
@@ -61,11 +61,12 @@ async def find_personal_contacts(company: Company, context: BrowserContext) -> C
 
 async def _bing_search(context: BrowserContext, query: str, company_name: str) -> list[dict]:
     page = await context.new_page()
+    await stealth_async(page)
     contacts: list[dict] = []
     try:
         url = _BING.format(q=quote_plus(query))
         await page.goto(url, timeout=30_000, wait_until="domcontentloaded")
-        await page.wait_for_timeout(1_500)
+        await page.wait_for_timeout(2_000)
 
         # Bing result structure: li.b_algo contains h2 > a (title+link) and p (snippet)
         results = await page.locator("li.b_algo").all()
