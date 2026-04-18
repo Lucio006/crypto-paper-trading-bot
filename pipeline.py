@@ -1,57 +1,54 @@
+"""
+Main pipeline: orchestrates validation → L1 → L2 → L3 → classify → dedup → Sheets.
+"""
 from __future__ import annotations
 import asyncio
-import uuid
 import re
 from datetime import date
-from loguru import logger
 from playwright.async_api import async_playwright, BrowserContext
 
-from models.company import Company, EventMeta
+from models import Company, EventMeta, make_event_id
+from scraper.utils import extract_domain, normalize_name
 from scraper.validator import is_valid_listing
 from scraper.level1_listing import scrape_listing
 from scraper.level2_profile import scrape_profile
 from scraper.level3_corporate import scrape_corporate
-from scraper.utils import extract_domain, normalize_name
-from intelligence.classifier import enrich_with_claude
-from intelligence.deduplicator import check_against_base
+from intelligence.classifier import enrich
+from deduplication import check as dedup_check
+from sheets.schema import event_tab_name
 from sheets.writer import (
-    ensure_base_tabs, write_event_tab, update_index, upsert_base, read_base_companies,
+    ensure_base_tabs, write_event_tab,
+    update_index, upsert_base, read_base_companies,
 )
-from sheets.formatter import format_all_tabs
-from config import MAX_COMPANIES, NAV_TIMEOUT
+from config import MAX_COMPANIES, NAV_TIMEOUT_MS
+
+_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0.0.0 Safari/537.36"
+)
 
 
-def make_tab_name(event_date: str, event_name: str) -> str:
-    safe_name = re.sub(r"[^\w\s\-]", "", event_name)[:30].strip()
-    return f"{event_date} | {safe_name}"
-
-
-def make_event_id(event_name: str, event_date: str) -> str:
-    slug = re.sub(r"\W+", "-", event_name.lower())[:20]
-    return f"{event_date}-{slug}"
-
-
-async def run_pipeline(
+async def run(
     event_name: str,
     event_date: str,
     listing_url: str,
     max_companies: int | None = None,
-    progress_callback=None,
+    on_progress=None,
 ) -> dict:
     """
-    Main pipeline. Returns a result dict with status, counts and any errors.
-    progress_callback(step: str, current: int, total: int) is called if provided.
+    Run the full pipeline.
+    on_progress(step: str, current: int, total: int) is called at each stage.
+    Returns a result dict.
     """
 
     def progress(step: str, current: int = 0, total: int = 0):
-        logger.info(f"[{step}] {current}/{total}")
-        if progress_callback:
-            progress_callback(step, current, total)
+        if on_progress:
+            on_progress(step, current, total)
 
     result = {
         "success": False,
-        "event_name": event_name,
-        "tab_name": make_tab_name(event_date, event_name),
+        "tab_name": event_tab_name(event_date, event_name),
         "companies_total": 0,
         "companies_new": 0,
         "companies_known": 0,
@@ -63,93 +60,72 @@ async def run_pipeline(
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=True)
         context: BrowserContext = await browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            ),
+            user_agent=_UA,
             viewport={"width": 1280, "height": 900},
         )
-        context.set_default_timeout(NAV_TIMEOUT)
 
         try:
-            # ── Validation ──────────────────────────────────────────────────
-            progress("Validando URL", 0, 1)
+            # ── Validate URL ─────────────────────────────────────────────────
+            progress("Validando URL")
             page = await context.new_page()
-            await page.goto(listing_url, timeout=NAV_TIMEOUT, wait_until="domcontentloaded")
+            await page.goto(listing_url, timeout=NAV_TIMEOUT_MS, wait_until="domcontentloaded")
             await page.wait_for_timeout(2000)
             valid, reason = await is_valid_listing(page)
             if not valid:
-                await page.close()
                 result["error"] = reason
                 return result
-
-            event_base_domain = extract_domain(listing_url) or ""
-            progress("URL validada", 1, 1)
+            event_domain = extract_domain(listing_url) or ""
 
             # ── Level 1: listing ─────────────────────────────────────────────
-            progress("Extrayendo listado de expositores", 0, 1)
+            progress("Extrayendo listado de expositores")
             companies = await scrape_listing(page, listing_url, limit)
             await page.close()
-
             if not companies:
                 result["error"] = "No se encontraron empresas en el listado."
                 return result
-
             progress("Listado extraído", len(companies), len(companies))
 
             # ── Load base for deduplication ──────────────────────────────────
-            progress("Cargando base de empresas", 0, 1)
-            try:
-                ensure_base_tabs()
-                base_records = read_base_companies()
-            except Exception as e:
-                logger.warning(f"Could not load base companies: {e}")
-                base_records = []
-            progress("Base cargada", 1, 1)
+            progress("Cargando base de empresas")
+            ensure_base_tabs()
+            base_records = read_base_companies()
 
             # ── Process each company ─────────────────────────────────────────
             total = len(companies)
             for i, company in enumerate(companies):
-                progress(f"Procesando {company.name_original}", i + 1, total)
                 company.name_normalized = normalize_name(company.name_original)
+                progress(f"Procesando: {company.name_original}", i + 1, total)
 
-                # Level 2: profile
                 try:
-                    company = await scrape_profile(company, context, event_base_domain)
-                except Exception as e:
-                    logger.warning(f"L2 error for {company.name_original}: {e}")
-
-                # Level 3: corporate website
+                    company = await scrape_profile(company, context, event_domain)
+                except Exception:
+                    pass
                 try:
                     company = await scrape_corporate(company, context)
-                except Exception as e:
-                    logger.warning(f"L3 error for {company.name_original}: {e}")
-
-                # Claude enrichment
+                except Exception:
+                    pass
                 try:
-                    company = await enrich_with_claude(company)
-                except Exception as e:
-                    logger.warning(f"Claude error for {company.name_original}: {e}")
+                    company = await enrich(company)
+                except Exception:
+                    pass
 
-                # Deduplication
-                company = check_against_base(company, base_records)
-
+                company = dedup_check(company, base_records)
                 companies[i] = company
 
             # ── Build event metadata ─────────────────────────────────────────
-            known = [c for c in companies if c.is_known]
-            new = [c for c in companies if not c.is_known]
+            new_cos   = [c for c in companies if not c.is_known]
+            known_cos = [c for c in companies if c.is_known]
+            tab = event_tab_name(event_date, event_name)
             event = EventMeta(
                 event_id=make_event_id(event_name, event_date),
                 event_name=event_name,
                 event_date=event_date,
-                tab_name=make_tab_name(event_date, event_name),
+                tab_name=tab,
                 listing_url=listing_url,
                 analysis_date=date.today().isoformat(),
                 companies_detected=len(companies),
-                companies_new=len(new),
-                companies_known=len(known),
+                companies_new=len(new_cos),
+                companies_known=len(known_cos),
                 status="Completado",
             )
 
@@ -160,20 +136,17 @@ async def run_pipeline(
             upsert_base(companies, event)
             progress("Escribiendo en Google Sheets", 2, 3)
             update_index(event)
-            progress("Aplicando formato", 3, 3)
-            format_all_tabs(event.tab_name, companies)
+            progress("Completado", len(companies), len(companies))
 
             result.update({
                 "success": True,
-                "tab_name": event.tab_name,
+                "tab_name": tab,
                 "companies_total": len(companies),
-                "companies_new": len(new),
-                "companies_known": len(known),
+                "companies_new": len(new_cos),
+                "companies_known": len(known_cos),
             })
-            progress("Completado", len(companies), len(companies))
 
         except Exception as e:
-            logger.exception(f"Pipeline error: {e}")
             result["error"] = str(e)
         finally:
             await browser.close()
