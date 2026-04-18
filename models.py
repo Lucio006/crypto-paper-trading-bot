@@ -92,6 +92,7 @@ class Company:
     requires_review: bool = False
     review_reason: Optional[str] = None
     notes: Optional[str] = None
+    personal_contacts: Optional[str] = None  # "Nombre — Cargo — linkedin.com/in/..." (one per line)
 
 
 @dataclass

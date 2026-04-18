@@ -91,6 +91,7 @@ def _event_row(company: Company, event: EventMeta) -> list[str]:
         reason_ceo_cco,
         _v(c.telegram),
         _v(c.reason_no_telegram),
+        _v(company.personal_contacts),
         _bool_es(company.is_known),
         _v(company.commercial_status),
     ]

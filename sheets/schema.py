@@ -71,6 +71,7 @@ EVENT_COLUMNS = [
     "Por qué no (CEO / CCO)",
     "Telegram",
     "Por qué no (Telegram)",
+    "Contactos LinkedIn",
     "Ya conocida",
     "Estado comercial",
 ]

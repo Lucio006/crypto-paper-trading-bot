@@ -14,6 +14,7 @@ from scraper.level1_listing import scrape_listing
 from scraper.level2_profile import scrape_profile
 from scraper.level3_corporate import scrape_corporate
 from scraper.level4_enrich import enrich_web
+from scraper.level5_linkedin import find_personal_contacts
 from intelligence.classifier import enrich
 from deduplication import check as dedup_check
 from sheets.schema import event_tab_name
@@ -107,6 +108,10 @@ async def run(
                     pass
                 try:
                     company = await enrich_web(company, context)
+                except Exception:
+                    pass
+                try:
+                    company = await find_personal_contacts(company, context)
                 except Exception:
                     pass
                 try:
