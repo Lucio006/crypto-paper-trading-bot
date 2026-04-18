@@ -3,7 +3,6 @@ Write companies and event metadata to Google Sheets.
 Column order is always driven by sheets/schema.py — never hardcoded here.
 """
 from __future__ import annotations
-import uuid
 from models import Company, EventMeta
 from sheets.client import get_or_create_worksheet
 from sheets.schema import (
@@ -78,57 +77,22 @@ def _base_row(company: Company, event: EventMeta) -> list[str]:
 
 def _event_row(company: Company, event: EventMeta) -> list[str]:
     c = company.contact
+    reason_ceo_cco = _v(c.reason_no_ceo) or _v(c.reason_no_cco)
     return [
-        str(uuid.uuid4())[:8],
-        _v(event.event_id),
-        _v(event.event_date),
-        _v(event.event_name),
         _v(company.name_original),
-        _v(company.name_normalized),
         _v(company.stand),
-        _v(company.exhibitor_profile_url),
-        _v(company.category),
-        _bool_es(company.is_known),
-        _bool_es(company.times_contacted > 0),
-        _v(company.description),
-        _v(company.website_from_event),
         _v(company.corporate_website),
-        _v(company.corporate_website),
-        _v(company.domain),
-        _v(company.country),
-        _v(company.sector),
-        _v(c.phone),
-        _v(c.email_general),
         _v(c.email_marketing),
+        _v(c.reason_no_marketing),
         _v(c.email_events),
+        _v(c.reason_no_events),
         _v(c.email_ceo),
         _v(c.email_cco),
+        reason_ceo_cco,
         _v(c.telegram),
-        _v(c.best_contact),
-        _v(c.best_contact_role),
-        _v(c.recommended_channel),
-        _v(c.contact_priority),
-        _v(company.first_event),
-        _v(company.last_event or event.event_name),
-        _v(company.last_contact_date),
-        _v(company.commercial_status),
-        _v(c.reason_no_marketing),
-        _v(c.reason_no_events),
-        _v(c.reason_no_ceo),
-        _v(c.reason_no_cco),
         _v(c.reason_no_telegram),
-        _v(c.reason_no_website),
-        _v(c.page_where_found),
-        _v(c.evidence_text),
-        _v(c.confidence_level),
-        _v(company.match_method),
-        _bool_es(company.requires_review),
-        _v(company.review_reason),
-        _v(company.notes),
-        "",        # Contacto realizado (manual)
-        "",        # Fecha de contacto (manual)
-        "Sin acción",
-        "",        # Responsable (manual)
+        _bool_es(company.is_known),
+        _v(company.commercial_status),
     ]
 
 
