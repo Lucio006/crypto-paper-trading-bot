@@ -1,6 +1,6 @@
 """
-Diagnostic: inspect the DOM structure of an exhibitor listing page.
-Helps identify the correct CSS selectors for level1_listing.py.
+Diagnostic: inspect the DOM structure of an exhibitor listing or profile page.
+Helps identify the correct CSS selectors for level1_listing.py and level2_profile.py.
 
 Usage: python diagnose_page.py <URL>
 """
@@ -9,29 +9,50 @@ import asyncio
 from playwright.async_api import async_playwright
 
 SELECTORS_TO_TEST = [
-    # Specific to common event platforms
     ".exhibitor-card", ".exhibitor-item", ".exhibitor-tile",
     ".exhibitor-list-item", ".exhibitor-grid-item",
     "[class='exhibitor']",
-    # Common patterns
-    ".company-card", ".company-item", ".company-tile",
-    "[data-exhibitor-id]", "[data-company-id]",
-    # Cards and grids
-    ".card--exhibitor", ".card--company",
-    # List items with links
-    "ul.exhibitors > li", "ul.companies > li",
-    ".grid > .item", ".list > .item",
-    # IFEMA / Feria Barcelona / common EU platforms
-    ".node--type-expositor", ".views-row",
-    # iGB / Reed / Informa platforms
     ".js-exhibitor", ".exhibitor-listing__item",
     "[class*='ExhibitorCard']", "[class*='exhibitor-card']",
     "[class*='CompanyCard']", "[class*='company-card']",
-    # React/Vue component names often appear in data attributes
+    ".m-exhibitors-list__items__item",
+    "[data-exhibitor-id]", "[data-company-id]",
+    ".card--exhibitor", ".card--company",
+    "ul.exhibitors > li", "ul.companies > li",
+    ".node--type-expositor", ".views-row",
     "[data-testid*='exhibitor']", "[data-testid*='company']",
-    # Broad fallbacks
     "article", "li:has(h2)", "li:has(h3)",
 ]
+
+COOKIE_BUTTONS = [
+    "#onetrust-accept-btn-handler",
+    ".ot-btn-accept-all",
+    "button#accept-all",
+    "button[id*='accept']",
+]
+COOKIE_TEXTS = ["Aceptar todo", "Aceptar todas", "Accept All", "Accept all", "Aceptar"]
+
+
+async def accept_cookies(page):
+    for sel in COOKIE_BUTTONS:
+        try:
+            btn = page.locator(sel).first
+            if await btn.count() > 0 and await btn.is_visible():
+                await btn.click()
+                await page.wait_for_timeout(800)
+                return
+        except Exception:
+            continue
+    for text in COOKIE_TEXTS:
+        try:
+            btn = page.get_by_role("button", name=text)
+            if await btn.count() > 0 and await btn.is_visible():
+                await btn.click()
+                await page.wait_for_timeout(800)
+                return
+        except Exception:
+            continue
+
 
 async def diagnose(url: str):
     print(f"\nDiagnosticando: {url}\n")
@@ -47,12 +68,14 @@ async def diagnose(url: str):
         )
         page = await context.new_page()
 
-        print("Cargando página (esperando JS)…")
+        print("Cargando página…")
         await page.goto(url, timeout=60_000, wait_until="networkidle")
-        await page.wait_for_timeout(3000)
-        print("Página cargada.\n")
+        await page.wait_for_timeout(2000)
+        print("Aceptando cookies si las hay…")
+        await accept_cookies(page)
+        await page.wait_for_timeout(1500)
+        print("Listo.\n")
 
-        # ── Title and URL after redirects ─────────────────────────────────────
         print(f"Título   : {await page.title()}")
         print(f"URL final: {page.url}\n")
 
@@ -78,18 +101,32 @@ async def diagnose(url: str):
             best_sel = hits[0][1]
             print(f"\n── HTML del primer elemento con «{best_sel}» ───────────────────")
             try:
-                first = page.locator(best_sel).first
-                html = await first.inner_html()
+                html = await page.locator(best_sel).first.inner_html()
                 print(html[:800])
             except Exception as e:
                 print(f"  Error: {e}")
 
-        # ── Classes that appear on many elements (helps spot patterns) ────────
-        print("\n── Clases CSS más frecuentes en la página ───────────────────────")
+        # ── All external links ────────────────────────────────────────────────
+        print("\n── Links externos encontrados (primeros 20) ─────────────────────")
+        try:
+            links = await page.locator("a[href^='http']").all()
+            shown = 0
+            for link in links:
+                href = await link.get_attribute("href") or ""
+                text = (await link.inner_text()).strip().replace("\n", " ")[:40]
+                if href and "igblive" not in href and "igb-live" not in href:
+                    print(f"  {text:<40}  →  {href}")
+                    shown += 1
+                    if shown >= 20:
+                        break
+        except Exception as e:
+            print(f"  Error: {e}")
+
+        # ── Most frequent CSS classes ─────────────────────────────────────────
+        print("\n── Clases CSS más frecuentes ────────────────────────────────────")
         classes: dict[str, int] = {}
         try:
-            all_els = await page.locator("[class]").all()
-            for el in all_els[:500]:
+            for el in await page.locator("[class]").all()[:500]:
                 try:
                     cls = await el.get_attribute("class") or ""
                     for c in cls.split():
@@ -98,8 +135,7 @@ async def diagnose(url: str):
                     continue
         except Exception:
             pass
-        top = sorted(classes.items(), key=lambda x: -x[1])[:30]
-        for cls, count in top:
+        for cls, count in sorted(classes.items(), key=lambda x: -x[1])[:25]:
             print(f"  {count:4d}  .{cls}")
 
         await browser.close()
