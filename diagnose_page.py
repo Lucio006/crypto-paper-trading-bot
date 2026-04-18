@@ -126,7 +126,8 @@ async def diagnose(url: str):
         print("\n── Clases CSS más frecuentes ────────────────────────────────────")
         classes: dict[str, int] = {}
         try:
-            for el in await page.locator("[class]").all()[:500]:
+            elements = await page.locator("[class]").all()
+            for el in elements[:500]:
                 try:
                     cls = await el.get_attribute("class") or ""
                     for c in cls.split():

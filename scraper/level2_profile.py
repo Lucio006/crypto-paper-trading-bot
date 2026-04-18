@@ -92,7 +92,11 @@ def _is_corporate(url: str, event_domain: str) -> bool:
     if not url or not is_valid_url(url):
         return False
     domain = extract_domain(url)
+    # Must have a dot and a TLD of at least 2 chars
     if not domain or "." not in domain:
+        return False
+    tld = domain.rsplit(".", 1)[-1]
+    if len(tld) < 2:
         return False
     for skip in _SKIP_DOMAINS:
         if domain == skip or domain.endswith("." + skip):
@@ -116,14 +120,14 @@ async def scrape_profile(
     try:
         await page.goto(
             company.exhibitor_profile_url,
-            timeout=25_000,
-            wait_until="domcontentloaded",
+            timeout=30_000,
+            wait_until="networkidle",
         )
-        await page.wait_for_timeout(1500)
-
-        # Dismiss cookie banner if present
-        await _accept_cookies(page)
         await page.wait_for_timeout(1000)
+
+        # Dismiss cookie banner if present, then wait for re-render
+        await _accept_cookies(page)
+        await page.wait_for_timeout(1500)
 
         body_text = await page.inner_text("body")
 
