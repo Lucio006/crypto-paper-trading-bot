@@ -1,9 +1,12 @@
+"""
+Google Sheets connection — singleton client and worksheet helpers.
+"""
+from __future__ import annotations
 import gspread
 from google.oauth2.service_account import Credentials
-from loguru import logger
-from config import GOOGLE_SERVICE_ACCOUNT_PATH, GOOGLE_SHEETS_ID
+from config import SHEETS_ID, CREDENTIALS_PATH
 
-SCOPES = [
+_SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
 ]
@@ -15,46 +18,38 @@ _spreadsheet: gspread.Spreadsheet | None = None
 def get_client() -> gspread.Client:
     global _client
     if _client is None:
-        creds = Credentials.from_service_account_file(
-            GOOGLE_SERVICE_ACCOUNT_PATH, scopes=SCOPES
-        )
+        creds = Credentials.from_service_account_file(CREDENTIALS_PATH, scopes=_SCOPES)
         _client = gspread.authorize(creds)
-        logger.debug("Google Sheets client initialized")
     return _client
 
 
 def get_spreadsheet() -> gspread.Spreadsheet:
     global _spreadsheet
     if _spreadsheet is None:
-        _spreadsheet = get_client().open_by_key(GOOGLE_SHEETS_ID)
-        logger.debug(f"Opened spreadsheet: {_spreadsheet.title}")
+        _spreadsheet = get_client().open_by_key(SHEETS_ID)
     return _spreadsheet
 
 
-def get_or_create_worksheet(name: str, rows: int = 1000, cols: int = 60) -> gspread.Worksheet:
+def get_or_create_worksheet(name: str, rows: int = 2000, cols: int = 60) -> gspread.Worksheet:
     ss = get_spreadsheet()
     try:
-        ws = ss.worksheet(name)
-        logger.debug(f"Opened existing worksheet: {name}")
-        return ws
+        return ss.worksheet(name)
     except gspread.WorksheetNotFound:
-        ws = ss.add_worksheet(title=name, rows=rows, cols=cols)
-        logger.info(f"Created worksheet: {name}")
-        return ws
+        return ss.add_worksheet(title=name, rows=rows, cols=cols)
 
 
 def worksheet_exists(name: str) -> bool:
-    ss = get_spreadsheet()
-    return any(ws.title == name for ws in ss.worksheets())
+    return any(ws.title == name for ws in get_spreadsheet().worksheets())
 
 
 def validate_connection() -> tuple[bool, str]:
+    """Return (ok, message). Safe to call before any other operation."""
     try:
         ss = get_spreadsheet()
-        return True, f"Conectado a: {ss.title}"
+        return True, f"Conectado a: «{ss.title}»"
     except FileNotFoundError:
-        return False, f"No se encontró el archivo de credenciales: {GOOGLE_SERVICE_ACCOUNT_PATH}"
+        return False, f"Credenciales no encontradas: {CREDENTIALS_PATH}"
     except gspread.exceptions.APIError as e:
-        return False, f"Error de API de Google: {e}"
+        return False, f"Error de API: {e}"
     except Exception as e:
         return False, f"Error de conexión: {e}"
