@@ -1,79 +1,70 @@
+"""
+Level 1 scraper: extract the list of exhibiting companies from the listing page.
+Returns a list of Company objects with partial data (name, stand, profile URL).
+"""
 from __future__ import annotations
 import re
 from playwright.async_api import Page
-from loguru import logger
-from models.company import Company
-from scraper.utils import normalize_name, normalize_url, extract_domain, make_absolute
+from models import Company
+from scraper.utils import normalize_name, make_absolute
 
-# ──────────────────────────────────────────────
-# Selectors tried in order for each event platform
-# ──────────────────────────────────────────────
-
-COMPANY_BLOCK_SELECTORS = [
+# Ordered list of CSS selectors to try for company blocks
+_BLOCK_SELECTORS = [
     # Platform-specific
     ".exhibitor-item", ".expositor-item", ".expositor-card",
     "[class*='exhibitor-list'] > *", "[class*='expositor-list'] > *",
     "[class*='company-card']", "[class*='empresa-card']",
     "[class*='participant-item']", "[class*='brand-item']",
-    # IFEMA / Feria Barcelona / Fira
-    ".node--type-expositor", ".views-row", ".field--name-title",
-    # Generic
-    ".card", ".listing-card", ".grid-card",
+    # IFEMA / Feria Barcelona
+    ".node--type-expositor", ".views-row",
+    # Generic cards and grids
+    ".card", ".listing-card", ".grid-item",
     "[data-exhibitor]", "[data-company-id]",
-    # Last resort: any <li> or <article> with a link inside
-    "li:has(a)", "article:has(a)",
+    # Last resort
+    "li:has(a[href])", "article:has(h2)",
 ]
 
-NAME_SELECTORS = [
-    "h2", "h3", "h4", ".company-name", ".nombre-empresa",
-    ".exhibitor-name", ".expositor-name", ".title", ".name",
-    "[class*='name']", "[class*='title']",
-    "strong", "b",
-]
+# Ordered list of selectors for the company name within a block
+_NAME_SELECTORS = ["h2", "h3", "h4", ".company-name", ".nombre", ".title", ".name",
+                   "[class*='name']", "[class*='title']", "strong"]
 
-STAND_PATTERNS = [
-    re.compile(r"stand[:\s]*([A-Z\d][\w\-/]*)", re.IGNORECASE),
-    re.compile(r"pabellón[:\s]*(\d+[\w\-/]*)", re.IGNORECASE),
-    re.compile(r"hall[:\s]*([A-Z\d][\w\-/]*)", re.IGNORECASE),
-    re.compile(r"booth[:\s]*([A-Z\d][\w\-/]*)", re.IGNORECASE),
-    re.compile(r"stand\s+([\w\d]+)", re.IGNORECASE),
-]
+_STAND_RE = re.compile(
+    r"(?:stand|booth|pabellón|hall)[:\s]*([A-Z\d][\w\-/]*)", re.IGNORECASE
+)
+_CATEGORY_RE = re.compile(
+    r"(?:categoría|category|sector|actividad)[:\s]+([^\n]{3,60})", re.IGNORECASE
+)
 
-
-def _extract_stand_from_text(text: str) -> str | None:
-    for pattern in STAND_PATTERNS:
-        m = pattern.search(text)
-        if m:
-            return m.group(1).strip()
-    return None
+# Keywords in a URL that suggest it's an exhibitor profile
+_PROFILE_KEYWORDS = ("expositor", "exhibitor", "empresa", "company", "stand",
+                     "participant", "brand", "patrocinador")
 
 
-async def scrape_listing(page: Page, listing_url: str, max_companies: int | None = None) -> list[Company]:
+async def scrape_listing(
+    page: Page,
+    listing_url: str,
+    max_companies: int | None = None,
+) -> list[Company]:
     """
-    Level 1: Extract companies from the event exhibitor listing page.
-    Returns a list of Company objects with partial data (name, stand, profile URL).
+    Extract companies from the exhibitor listing page.
+    Falls back to link-based extraction if no structured blocks are found.
     """
-    logger.info(f"Level 1: scraping listing {listing_url}")
     companies: list[Company] = []
-    seen_names: set[str] = set()
+    seen_norms: set[str] = set()
 
-    # Try each selector until we find blocks
+    # Find the best selector
     blocks = None
-    used_selector = None
-    for selector in COMPANY_BLOCK_SELECTORS:
+    for selector in _BLOCK_SELECTORS:
         try:
             count = await page.locator(selector).count()
             if count >= 3:
                 blocks = page.locator(selector)
-                used_selector = selector
-                logger.info(f"Using selector '{selector}' → {count} blocks")
                 break
         except Exception:
             continue
 
     if blocks is None:
-        logger.warning("No structured blocks found, falling back to link extraction")
-        return await _fallback_link_extraction(page, listing_url, max_companies)
+        return await _fallback_links(page, listing_url, max_companies)
 
     total = await blocks.count()
     limit = min(total, max_companies) if max_companies else total
@@ -81,101 +72,93 @@ async def scrape_listing(page: Page, listing_url: str, max_companies: int | None
     for i in range(limit):
         block = blocks.nth(i)
         try:
-            block_text = await block.inner_text()
-            block_html = await block.inner_html()
-            if not block_text.strip():
+            block_text = (await block.inner_text()).strip()
+            if not block_text:
                 continue
 
-            # Extract company name
+            # ── Name ─────────────────────────────────────────────────────────
             name = None
-            for ns in NAME_SELECTORS:
+            for ns in _NAME_SELECTORS:
                 try:
                     el = block.locator(ns).first
                     if await el.count() > 0:
-                        text = (await el.inner_text()).strip()
-                        if text and len(text) > 1:
-                            name = text
+                        t = (await el.inner_text()).strip()
+                        if len(t) > 1:
+                            name = t
                             break
                 except Exception:
                     continue
             if not name:
-                # Fallback: first non-empty line
                 lines = [l.strip() for l in block_text.split("\n") if l.strip()]
                 name = lines[0] if lines else None
             if not name or len(name) < 2:
                 continue
 
             norm = normalize_name(name)
-            if norm in seen_names:
+            if norm in seen_norms or len(norm) < 2:
                 continue
-            seen_names.add(norm)
+            seen_norms.add(norm)
 
-            # Extract stand
-            stand = _extract_stand_from_text(block_text)
+            # ── Stand ─────────────────────────────────────────────────────────
+            stand = None
+            m = _STAND_RE.search(block_text)
+            if m:
+                stand = m.group(1).strip()
 
-            # Extract category (text between stand and next heading, heuristic)
+            # ── Category ──────────────────────────────────────────────────────
             category = None
-            cat_match = re.search(
-                r"(?:categoría|category|sector)[:\s]+([^\n]+)", block_text, re.IGNORECASE
-            )
-            if cat_match:
-                category = cat_match.group(1).strip()
+            m = _CATEGORY_RE.search(block_text)
+            if m:
+                category = m.group(1).strip()
 
-            # Extract profile link (first internal link in block)
+            # ── Profile URL ───────────────────────────────────────────────────
             profile_url = None
             try:
-                links = await block.locator("a").all()
+                links = await block.locator("a[href]").all()
+                # Prefer links that look like exhibitor profiles
                 for link in links:
-                    href = await link.get_attribute("href")
-                    if href and not href.startswith(("mailto:", "tel:", "javascript:")):
-                        abs_href = make_absolute(href, listing_url)
-                        # Prefer links that look like exhibitor profiles
-                        if any(kw in abs_href.lower() for kw in
-                               ["expositor", "exhibitor", "empresa", "company", "stand", "participant"]):
-                            profile_url = abs_href
-                            break
+                    href = await link.get_attribute("href") or ""
+                    if href.startswith(("mailto:", "tel:", "javascript:")):
+                        continue
+                    abs_href = make_absolute(href, listing_url)
+                    if any(kw in abs_href.lower() for kw in _PROFILE_KEYWORDS):
+                        profile_url = abs_href
+                        break
                 if not profile_url and links:
-                    href = await links[0].get_attribute("href")
-                    if href and not href.startswith(("mailto:", "tel:", "javascript:")):
+                    href = await links[0].get_attribute("href") or ""
+                    if not href.startswith(("mailto:", "tel:", "javascript:")):
                         profile_url = make_absolute(href, listing_url)
             except Exception:
                 pass
 
-            company = Company(
+            companies.append(Company(
                 name_original=name,
                 name_normalized=norm,
                 stand=stand,
-                exhibitor_profile_url=profile_url,
                 category=category,
-            )
-            companies.append(company)
-            logger.debug(f"  Found: {name} | stand={stand} | profile={profile_url}")
+                exhibitor_profile_url=profile_url,
+            ))
 
-        except Exception as e:
-            logger.warning(f"Error parsing block {i}: {e}")
+        except Exception:
             continue
 
-    logger.info(f"Level 1 complete: {len(companies)} companies extracted")
     return companies
 
 
-async def _fallback_link_extraction(
+async def _fallback_links(
     page: Page, base_url: str, max_companies: int | None
 ) -> list[Company]:
-    """Fallback: extract unique-looking company links from the page."""
-    companies = []
+    """Fallback: harvest unique-looking text links as company names."""
+    companies: list[Company] = []
     seen: set[str] = set()
-
     links = await page.locator("a[href]").all()
-    limit = max_companies or len(links)
 
-    for link in links[:limit * 5]:  # scan more links to find enough
+    for link in links:
         try:
-            href = await link.get_attribute("href")
+            href = await link.get_attribute("href") or ""
             text = (await link.inner_text()).strip()
-            if not href or not text or len(text) < 3:
+            if not text or len(text) < 3 or href.startswith(("mailto:", "tel:", "#")):
                 continue
-            abs_href = make_absolute(href, base_url)
             norm = normalize_name(text)
             if norm in seen or len(norm) < 3:
                 continue
@@ -183,12 +166,11 @@ async def _fallback_link_extraction(
             companies.append(Company(
                 name_original=text,
                 name_normalized=norm,
-                exhibitor_profile_url=abs_href,
+                exhibitor_profile_url=make_absolute(href, base_url),
             ))
             if max_companies and len(companies) >= max_companies:
                 break
         except Exception:
             continue
 
-    logger.info(f"Fallback extracted {len(companies)} companies via links")
     return companies

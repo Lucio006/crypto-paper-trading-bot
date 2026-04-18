@@ -1,89 +1,74 @@
+"""
+Validate that a URL is a genuine exhibitor listing before running the full scraper.
+Returns (True, reason) or (False, reason).
+"""
 from __future__ import annotations
+import re
 from playwright.async_api import Page
-from loguru import logger
 
-# Minimum signals required to consider a page a valid exhibitor listing
-MIN_COMPANIES = 3
+# Minimum number of company-like elements to consider the page valid
+_MIN_BLOCKS = 3
 
-# CSS selectors / text patterns that suggest an exhibitor listing
-LISTING_SIGNALS = [
-    # Common class names / attributes used by event platforms
+# CSS selectors that suggest an exhibitor listing
+_LISTING_SELECTORS = [
     "[class*='exhibitor']",
     "[class*='expositor']",
-    "[class*='company']",
+    "[class*='company-list']",
     "[class*='empresa']",
-    "[class*='stand']",
     "[class*='participant']",
-    "[class*='participante']",
-    "[class*='brand']",
-    "[class*='sponsor']",
+    "[class*='brand-list']",
+    "[class*='sponsor-list']",
     "[class*='patrocinador']",
-    # Generic card/list structures that might contain companies
-    ".card", ".listing-item", ".grid-item",
-    "[data-company]", "[data-exhibitor]",
-    # IFEMA and common Spanish event platforms
-    "[class*='feria']",
-    "[class*='exposicion']",
+    # IFEMA / Feria Barcelona / Fira
+    ".node--type-expositor",
+    ".views-row",
+    # Common card/grid patterns
+    ".card-grid .card",
+    ".listing .item",
+    ".grid .item",
+    # Last resort
+    "ul.list > li:has(a)",
+    "article:has(h2):has(a)",
 ]
 
-# Text patterns suggesting company names (heuristic: multiple items with similar structure)
-TEXT_SIGNALS = [
-    r"stand\s*[A-Z]?\d+",          # "Stand B12"
-    r"pabellón\s*\d+",              # "Pabellón 6"
-    r"hall\s*[A-Z]?\d+",            # "Hall 4"
-    r"booth\s*[A-Z]?\d+",           # "Booth 12"
-    r"expositor",
-    r"exhibitor",
+# Text patterns that strongly suggest an exhibitor listing
+_TEXT_SIGNALS = [
+    re.compile(r"\bstand\b", re.I),
+    re.compile(r"\bpabellón\b", re.I),
+    re.compile(r"\bhall\s*\d", re.I),
+    re.compile(r"\bbooth\b", re.I),
+    re.compile(r"\bexpositor", re.I),
+    re.compile(r"\bexhibitor", re.I),
+    re.compile(r"\bparticipante", re.I),
+    re.compile(r"\bexpositores", re.I),
 ]
 
 
 async def is_valid_listing(page: Page) -> tuple[bool, str]:
-    """
-    Returns (is_valid, reason).
-    Checks for signals that the page is genuinely an exhibitor listing.
-    """
-    import re
-
     body_text = await page.inner_text("body")
-    body_lower = body_text.lower()
 
-    # Check for minimum number of company-like blocks via CSS
-    signal_hits = 0
-    matched_selector = None
-    for selector in LISTING_SIGNALS:
+    # ── Check 1: CSS selectors ──────────────────────────────────────────────
+    for selector in _LISTING_SELECTORS:
         try:
             count = await page.locator(selector).count()
-            if count >= MIN_COMPANIES:
-                signal_hits += 1
-                matched_selector = selector
-                logger.debug(f"Selector '{selector}' matched {count} elements")
-                break
+            if count >= _MIN_BLOCKS:
+                return True, f"Estructura de listado detectada ({count} bloques con '{selector}')"
         except Exception:
             continue
 
-    # Check for text signals
-    text_hits = 0
-    for pattern in TEXT_SIGNALS:
-        if re.search(pattern, body_lower, re.IGNORECASE):
-            text_hits += 1
+    # ── Check 2: text signals ───────────────────────────────────────────────
+    hits = [p.pattern for p in _TEXT_SIGNALS if p.search(body_text)]
+    if len(hits) >= 2:
+        return True, f"Señales de texto de listado: {hits}"
 
-    # Count potential company names: look for multiple title-cased short phrases
-    potential_names = len(re.findall(r"\b[A-Z][a-záéíóúñA-Z&]{2,}\b(?:\s+[A-Z][a-z]+){0,4}", body_text))
-
-    logger.debug(
-        f"Validation: css_hits={signal_hits}, text_hits={text_hits}, "
-        f"potential_names={potential_names}"
-    )
-
-    if signal_hits > 0:
-        return True, f"Estructura de listado detectada (selector: {matched_selector})"
-    if text_hits >= 2 and potential_names >= MIN_COMPANIES * 3:
-        return True, f"Señales de texto de listado detectadas ({text_hits} patrones)"
-    if potential_names >= 20:
-        return True, f"Múltiples nombres de empresa detectados ({potential_names})"
+    # ── Check 3: density of title-cased short phrases (company names) ───────
+    names = re.findall(r"\b[A-ZÁÉÍÓÚÑ][a-záéíóúñA-Z&]{2,}(?:\s+[A-ZÁÉÍÓÚÑ][a-z]+){0,3}\b", body_text)
+    unique_names = len(set(names))
+    if unique_names >= 15:
+        return True, f"Múltiples nombres de empresa detectados ({unique_names})"
 
     return (
         False,
         "La URL proporcionada no parece un listado válido de expositores. "
-        "No se encontraron suficientes señales de empresas, stands o fichas.",
+        "No se encontraron suficientes señales de empresas, stands o fichas de expositor.",
     )
