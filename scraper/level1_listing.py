@@ -219,7 +219,8 @@ async def _extract_stand(block, block_text: str) -> str | None:
             if await el.count() > 0:
                 t = (await el.inner_text()).strip()
                 if t:
-                    return t
+                    m = _STAND_RE.search(t)
+                    return m.group(1).strip() if m else t
         except Exception:
             continue
     m = _STAND_RE.search(block_text)
