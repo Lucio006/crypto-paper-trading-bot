@@ -6,34 +6,48 @@ load_dotenv()
 
 BASE_DIR = Path(__file__).parent
 
+# ── Google Sheets ─────────────────────────────────────────────────────────────
+SHEETS_ID: str = os.environ.get("GOOGLE_SHEETS_ID", "")
+CREDENTIALS_PATH: str = os.environ.get(
+    "GOOGLE_SERVICE_ACCOUNT_PATH",
+    str(BASE_DIR / "credentials" / "service_account.json"),
+)
+
+# ── Anthropic ─────────────────────────────────────────────────────────────────
 ANTHROPIC_API_KEY: str = os.environ.get("ANTHROPIC_API_KEY", "")
-GOOGLE_SHEETS_ID: str = os.environ.get("GOOGLE_SHEETS_ID", "")
-GOOGLE_SERVICE_ACCOUNT_PATH: str = os.environ.get(
-    "GOOGLE_SERVICE_ACCOUNT_PATH", "./credentials/service_account.json"
-)
-MAX_COMPANIES: int | None = (
-    int(os.environ["MAX_COMPANIES"]) if os.environ.get("MAX_COMPANIES") else None
-)
+
+# ── Playwright ────────────────────────────────────────────────────────────────
+PAGE_TIMEOUT_MS: int = 30_000   # per-page load
+NAV_TIMEOUT_MS: int = 60_000    # browser navigation
+
+# ── Deduplication thresholds (rapidfuzz token_sort_ratio 0–100) ───────────────
+FUZZY_HIGH: int = 85   # ≥ this → automatic match
+FUZZY_LOW: int = 70    # between LOW and HIGH → flag for manual review
+
+# ── Debug ─────────────────────────────────────────────────────────────────────
 DEBUG: bool = os.environ.get("DEBUG", "false").lower() == "true"
 
-# Playwright timeouts (ms)
-PAGE_TIMEOUT = 30_000
-NAV_TIMEOUT = 60_000
 
-# Fuzzy match threshold for deduplication
-FUZZY_MATCH_HIGH = 85   # auto-match
-FUZZY_MATCH_LOW = 70    # needs review
+def validate() -> list[str]:
+    """Return a list of configuration errors. Empty list means all good."""
+    errors = []
+    if not SHEETS_ID:
+        errors.append("GOOGLE_SHEETS_ID no definido en .env")
+    if not Path(CREDENTIALS_PATH).exists():
+        errors.append(f"Credenciales no encontradas: {CREDENTIALS_PATH}")
+    return errors
 
-# Commercial status values
-STATUS_NEW = "Nueva"
-STATUS_NOT_CONTACTED = "No contactada"
-STATUS_CONTACTED = "Contactada"
-STATUS_FOLLOW_UP = "Pendiente de volver a contactar"
-STATUS_IN_CONVERSATION = "En conversación"
-STATUS_WON = "Ganada"
-STATUS_LOST = "Perdida"
-STATUS_DO_NOT_CONTACT = "No contactar"
 
-# Google Sheets tab names
-TAB_INDEX = "ÍNDICE EVENTOS"
-TAB_BASE = "BASE EMPRESAS"
+if __name__ == "__main__":
+    print(f"SHEETS_ID         : {SHEETS_ID[:12]}…" if SHEETS_ID else "SHEETS_ID         : ✗ no definido")
+    print(f"CREDENTIALS_PATH  : {CREDENTIALS_PATH}")
+    print(f"  existe          : {'✓' if Path(CREDENTIALS_PATH).exists() else '✗'}")
+    print(f"ANTHROPIC_API_KEY : {'✓ definida' if ANTHROPIC_API_KEY else '✗ no definida'}")
+    print(f"DEBUG             : {DEBUG}")
+    errors = validate()
+    if errors:
+        print("\nErrores:")
+        for e in errors:
+            print(f"  ✗ {e}")
+    else:
+        print("\n✓ Configuración OK")
