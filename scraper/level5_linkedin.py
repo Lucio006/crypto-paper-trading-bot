@@ -1,16 +1,17 @@
 """
 Level 5: LinkedIn personal contact finder.
-Uses a saved li_at session cookie to search LinkedIn directly.
-Searches for employees by company name + role keywords.
-Falls back gracefully if cookie missing or LinkedIn blocks.
+Uses a saved Playwright storage_state (full session) to search LinkedIn directly.
+Falls back gracefully if credentials missing or LinkedIn blocks.
 """
 from __future__ import annotations
 import asyncio
 import re
+from pathlib import Path
 from urllib.parse import quote_plus
 from playwright.async_api import BrowserContext
 from models import Company
-from config import LINKEDIN_COOKIE
+
+_STATE_FILE = Path(__file__).parent.parent / "credentials" / "linkedin_state.json"
 
 _SEARCH_URL = (
     "https://www.linkedin.com/search/results/people/"
@@ -28,9 +29,9 @@ _ROLE_FILTERS = [
 async def find_personal_contacts(company: Company, context: BrowserContext) -> Company:
     """
     Search LinkedIn for employees of this company. Never raises.
-    Requires LINKEDIN_COOKIE in .env — skips silently if missing.
+    Requires credentials/linkedin_state.json — skips silently if missing.
     """
-    if not LINKEDIN_COOKIE or not company.name_original:
+    if not _STATE_FILE.exists() or not company.name_original:
         return company
 
     found: dict[str, dict] = {}
@@ -65,23 +66,38 @@ async def _search_people(context: BrowserContext, query: str, company_name: str)
     try:
         url = _SEARCH_URL.format(q=quote_plus(query))
         await page.goto(url, timeout=30_000, wait_until="domcontentloaded")
-        await page.wait_for_timeout(2_500)
+        await page.wait_for_timeout(3_000)
 
-        # If redirected to login wall, cookie has expired
+        # Bail if redirected to login wall
         if "linkedin.com/login" in page.url or "authwall" in page.url:
             return []
 
-        # LinkedIn people search results
-        results = await page.locator("li.reusable-search__result-container").all()
-        if not results:
-            # Fallback selector for newer LinkedIn UI
-            results = await page.locator("[data-view-name='search-entity-result-universal-template']").all()
+        # Collect all /in/ profile links on the page
+        link_els = await page.locator("a[href*='/in/']").all()
 
-        for result in results[:8]:
+        seen_slugs: set[str] = set()
+        for el in link_els:
             try:
-                contact = await _parse_result(result, company_name)
-                if contact:
-                    contacts.append(contact)
+                href = await el.get_attribute("href") or ""
+                m = re.search(r"linkedin\.com/in/([\w\-%]+)", href)
+                if not m:
+                    continue
+                slug = m.group(1).lower()
+                if slug in seen_slugs or slug in ("", "me"):
+                    continue
+                seen_slugs.add(slug)
+
+                profile_url = f"https://www.linkedin.com/in/{m.group(1)}"
+
+                # The link text contains "Name\n • Degree\n\nJob Title"
+                raw = (await el.inner_text()).strip()
+                name, title = _parse_link_text(raw, company_name)
+                if not name:
+                    continue
+
+                contacts.append({"name": name, "title": title, "url": profile_url})
+                if len(contacts) >= 8:
+                    break
             except Exception:
                 continue
 
@@ -90,60 +106,24 @@ async def _search_people(context: BrowserContext, query: str, company_name: str)
     return contacts
 
 
-async def _parse_result(result, company_name: str) -> dict | None:
-    # Name
+def _parse_link_text(raw: str, company_name: str) -> tuple[str, str]:
+    """Extract name and title from a LinkedIn search result link's text content."""
+    # Strip degree indicators (• 1st, • 2nd, • 3er+, etc.)
+    cleaned = re.sub(r"•\s*\d+(st|nd|rd|er)\+?", "", raw)
+    # Collapse whitespace/newlines
+    parts = [p.strip() for p in re.split(r"[\n\r]+", cleaned) if p.strip()]
+
     name = ""
-    for sel in [
-        ".entity-result__title-text a span[aria-hidden='true']",
-        ".app-aware-link span[aria-hidden='true']",
-        "span.entity-result__title-line span[aria-hidden]",
-    ]:
-        try:
-            el = result.locator(sel).first
-            if await el.count() > 0:
-                name = (await el.inner_text()).strip()
-                if name and name != "LinkedIn Member":
-                    break
-        except Exception:
-            pass
-
-    if not name or name == "LinkedIn Member":
-        return None
-
-    # Title / headline
     title = ""
-    for sel in [
-        ".entity-result__primary-subtitle",
-        ".entity-result__summary",
-        "[data-anonymize='job-title']",
-    ]:
-        try:
-            el = result.locator(sel).first
-            if await el.count() > 0:
-                title = (await el.inner_text()).strip()
-                if title:
-                    break
-        except Exception:
-            pass
 
-    # Profile URL
-    url = ""
-    for sel in [
-        "a.app-aware-link[href*='/in/']",
-        ".entity-result__title-text a[href*='/in/']",
-    ]:
-        try:
-            el = result.locator(sel).first
-            if await el.count() > 0:
-                href = await el.get_attribute("href") or ""
-                m = re.search(r"linkedin\.com/in/([\w\-%]+)", href)
-                if m:
-                    url = f"https://www.linkedin.com/in/{m.group(1)}"
-                    break
-        except Exception:
-            pass
+    for part in parts:
+        if not name:
+            # First non-empty part is the name — skip "LinkedIn Member"
+            if part and part.lower() != "linkedin member":
+                name = part
+        elif not title:
+            # Second part is the headline/title
+            title = part
+            break
 
-    if not url:
-        return None
-
-    return {"name": name, "title": title or "—", "url": url}
+    return name, title or "—"
