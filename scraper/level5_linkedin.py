@@ -92,11 +92,28 @@ async def find_personal_contacts(company: Company, context: BrowserContext) -> C
             await browser.close()
 
     if found:
-        lines = []
-        for c in list(found.values())[:6]:
+        leftover: list[str] = []
+        for c in list(found.values())[:8]:
             label = _classify(c["title"])
-            lines.append(f"[{label}] {c['name']} — {c['title']} — {c['url']}")
-        company.personal_contacts = "\n".join(lines)
+            li_str = f"[LinkedIn] {c['name']} — {c['title']} — {c['url']}"
+
+            if label == "CEO/Director" and not company.contact.email_ceo:
+                company.contact.email_ceo = li_str
+                company.contact.reason_no_ceo = None
+            elif label == "CCO" and not company.contact.email_cco:
+                company.contact.email_cco = li_str
+                company.contact.reason_no_cco = None
+            elif label == "Marketing" and not company.contact.email_marketing:
+                company.contact.email_marketing = li_str
+                company.contact.reason_no_marketing = None
+            elif label == "Eventos/Patrocinios" and not company.contact.email_events:
+                company.contact.email_events = li_str
+                company.contact.reason_no_events = None
+            else:
+                leftover.append(f"[{label}] {c['name']} — {c['title']} — {c['url']}")
+
+        if leftover:
+            company.personal_contacts = "\n".join(leftover)
 
     return company
 
