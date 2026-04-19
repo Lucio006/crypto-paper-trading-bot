@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import re
 from datetime import date
+from pathlib import Path
 from playwright.async_api import async_playwright, BrowserContext
 
 from models import Company, EventMeta, make_event_id
@@ -29,6 +30,8 @@ _UA = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/120.0.0.0 Safari/537.36"
 )
+
+_LINKEDIN_STATE = Path(__file__).parent / "credentials" / "linkedin_state.json"
 
 
 async def run(
@@ -61,19 +64,12 @@ async def run(
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=True)
+        li_state = str(_LINKEDIN_STATE) if _LINKEDIN_STATE.exists() else None
         context: BrowserContext = await browser.new_context(
             user_agent=_UA,
             viewport={"width": 1280, "height": 900},
+            storage_state=li_state,
         )
-        if LINKEDIN_COOKIE:
-            await context.add_cookies([{
-                "name": "li_at",
-                "value": LINKEDIN_COOKIE,
-                "domain": ".linkedin.com",
-                "path": "/",
-                "httpOnly": True,
-                "secure": True,
-            }])
 
         try:
             # ── Validate URL ─────────────────────────────────────────────────
