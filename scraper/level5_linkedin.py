@@ -36,6 +36,13 @@ _ROLE_QUERIES = [
     "affiliate partnerships",
 ]
 
+_EMAIL_RE = re.compile(r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}')
+_NOISE_DOMAINS = {
+    "example.com", "test.com", "sentry.io", "linkedin.com",
+    "google.com", "gmail.com", "hotmail.com", "yahoo.com",
+    "wixpress.com", "amazonaws.com", "cloudflare.com",
+}
+
 
 def _classify(title: str) -> str:
     t = title.lower()
@@ -93,29 +100,67 @@ async def find_personal_contacts(company: Company, context: BrowserContext) -> C
 
     if found:
         leftover: list[str] = []
+        domain = company.domain or ""
         for c in list(found.values())[:8]:
             label = _classify(c["title"])
-            li_str = f"[LinkedIn] {c['name']} — {c['title']} — {c['url']}"
+            # Try to find a real email for this person
+            email = await _find_person_email(li_ctx, c["name"], company.name_original, domain)
+            contact_str = email if email else f"[LinkedIn] {c['name']} — {c['title']} — {c['url']}"
 
             if label == "CEO/Director" and not company.contact.email_ceo:
-                company.contact.email_ceo = li_str
+                company.contact.email_ceo = contact_str
                 company.contact.reason_no_ceo = None
             elif label == "CCO" and not company.contact.email_cco:
-                company.contact.email_cco = li_str
+                company.contact.email_cco = contact_str
                 company.contact.reason_no_cco = None
             elif label == "Marketing" and not company.contact.email_marketing:
-                company.contact.email_marketing = li_str
+                company.contact.email_marketing = contact_str
                 company.contact.reason_no_marketing = None
             elif label == "Eventos/Patrocinios" and not company.contact.email_events:
-                company.contact.email_events = li_str
+                company.contact.email_events = contact_str
                 company.contact.reason_no_events = None
             else:
-                leftover.append(f"[{label}] {c['name']} — {c['title']} — {c['url']}")
+                leftover.append(f"[{label}] {c['name']} — {c['title']} — {contact_str}")
 
         if leftover:
             company.personal_contacts = "\n".join(leftover)
 
     return company
+
+
+async def _find_person_email(ctx, name: str, company_name: str, domain: str) -> str:
+    """Search DuckDuckGo for a person's work email. Returns email or empty string."""
+    page = await ctx.new_page()
+    try:
+        queries = [f'"{name}" "{company_name}" email contact']
+        if domain:
+            queries.insert(0, f'"{name}" site:{domain}')
+
+        found_emails: list[str] = []
+        for query in queries:
+            url = f"https://html.duckduckgo.com/html/?q={quote_plus(query)}"
+            try:
+                await page.goto(url, timeout=20_000, wait_until="domcontentloaded")
+                await page.wait_for_timeout(1_500)
+                content = await page.content()
+                for m in _EMAIL_RE.finditer(content):
+                    email = m.group(0).lower()
+                    d = email.split("@")[1]
+                    if d not in _NOISE_DOMAINS:
+                        found_emails.append((email, d))
+            except Exception:
+                continue
+
+        if not found_emails:
+            return ""
+        # Prefer emails from the company's own domain
+        if domain:
+            for email, d in found_emails:
+                if domain in d:
+                    return email
+        return found_emails[0][0]
+    finally:
+        await page.close()
 
 
 async def _scrape_company_website(ctx, company_name: str) -> str:

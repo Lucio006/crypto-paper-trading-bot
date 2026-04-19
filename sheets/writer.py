@@ -3,6 +3,7 @@ Write companies and event metadata to Google Sheets.
 Column order is always driven by sheets/schema.py — never hardcoded here.
 """
 from __future__ import annotations
+import uuid
 from models import Company, EventMeta
 from sheets.client import get_or_create_worksheet
 from sheets.schema import (
